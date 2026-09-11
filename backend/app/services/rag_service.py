@@ -1,16 +1,24 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
-from functools import lru_cache
+import threading
 
-from sentence_transformers import SentenceTransformer
+import numpy as np
+import onnxruntime as ort
+from huggingface_hub import hf_hub_download
+from tokenizers import Tokenizer
 from supabase import Client, create_client
 
 from app.config import settings
 
 
 logger = logging.getLogger(__name__)
+
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+_embedding_model: "OnnxEmbeddingModel | None" = None
+_embedding_model_lock = threading.Lock()
 
 
 PROVINCE_DOMAINS = {"tenancy", "labor", "consumer"}
@@ -59,9 +67,49 @@ def _deduplicate_and_rerank(sources: list[dict], message: str, domain: str | Non
     return results
 
 
-@lru_cache(maxsize=1)
-def get_embedding_model() -> SentenceTransformer:
-    return SentenceTransformer(settings.embedding_model)
+class OnnxEmbeddingModel:
+    def __init__(self) -> None:
+        model_path = hf_hub_download(settings.embedding_onnx_model, "model.onnx")
+        tokenizer_path = hf_hub_download(settings.embedding_onnx_model, "tokenizer.json")
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.tokenizer.enable_truncation(max_length=128)
+        self.session = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"],
+            sess_options=self._session_options(),
+        )
+        self.input_names = {item.name for item in self.session.get_inputs()}
+
+    @staticmethod
+    def _session_options() -> ort.SessionOptions:
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        return options
+
+    def encode(self, text: str) -> list[float]:
+        encoded = self.tokenizer.encode(text)
+        inputs = {
+            "input_ids": np.asarray([encoded.ids], dtype=np.int64),
+            "attention_mask": np.asarray([encoded.attention_mask], dtype=np.int64),
+            "token_type_ids": np.asarray([encoded.type_ids], dtype=np.int64),
+        }
+        outputs = self.session.run(None, {name: value for name, value in inputs.items() if name in self.input_names})
+        embedding = np.asarray(outputs[0], dtype=np.float32).reshape(-1)
+        embedding /= max(np.linalg.norm(embedding), 1e-12)
+        return embedding.tolist()
+
+
+def get_embedding_model() -> OnnxEmbeddingModel:
+    global _embedding_model
+    if _embedding_model is None:
+        with _embedding_model_lock:
+            if _embedding_model is None:
+                logger.info("Loading ONNX embedding model on CPU: %s", settings.embedding_onnx_model)
+                _embedding_model = OnnxEmbeddingModel()
+                logger.info("ONNX embedding model loaded: %s", settings.embedding_onnx_model)
+    return _embedding_model
 
 
 def get_supabase() -> Client:
@@ -71,9 +119,7 @@ def get_supabase() -> Client:
 
 
 def retrieve(message: str, jurisdictions: list[str], domain: str | None) -> list[dict]:
-    query_embedding = get_embedding_model().encode(
-        _retrieval_query(message, domain), normalize_embeddings=True
-    ).tolist()
+    query_embedding = get_embedding_model().encode(_retrieval_query(message, domain))
     match_count = CRIMINAL_RETRIEVAL_COUNT if domain == "criminal" else DEFAULT_RETRIEVAL_COUNT
     response = get_supabase().rpc(
         "match_legal_docs",

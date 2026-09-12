@@ -11,7 +11,7 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 EMBEDDING_FAILURE_MESSAGE = "Our AI service is temporarily busy. Please try again in a moment."
-HF_INFERENCE_URL = "https://router.huggingface.co/hf-inference/models/{model}"
+HF_INFERENCE_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/{model}"
 
 
 PROVINCE_DOMAINS = {"tenancy", "labor", "consumer"}
@@ -67,7 +67,7 @@ def get_query_embedding(text: str) -> list[float]:
     url = HF_INFERENCE_URL.format(model=settings.embedding_model)
     request_payload = {
         "inputs": text,
-        "normalize": True,
+        "options": {"wait_for_model": True},
     }
     logger.info(
         "Hugging Face embedding request: url=%s payload_keys=%s input_chars=%d authorization=Bearer <redacted>",

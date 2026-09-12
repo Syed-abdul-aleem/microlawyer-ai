@@ -65,17 +65,32 @@ def get_query_embedding(text: str) -> list[float]:
         raise RuntimeError(EMBEDDING_FAILURE_MESSAGE)
 
     url = HF_INFERENCE_URL.format(model=settings.embedding_model)
+    request_payload = {
+        "inputs": text,
+        "normalize": True,
+    }
+    logger.info(
+        "Hugging Face embedding request: url=%s payload_keys=%s input_chars=%d authorization=Bearer <redacted>",
+        url,
+        sorted(request_payload),
+        len(text),
+    )
     try:
         response = httpx.post(
             url,
-            headers={"Authorization": f"Bearer {settings.huggingface_api_key}"},
-            json={
-                "inputs": text,
-                "parameters": {"pooling": "mean", "normalize": True},
-                "options": {"wait_for_model": True},
+            headers={
+                "Authorization": f"Bearer {settings.huggingface_api_key}",
+                "Content-Type": "application/json",
             },
+            json=request_payload,
             timeout=httpx.Timeout(30.0, connect=10.0),
         )
+        if response.is_error:
+            logger.error(
+                "Hugging Face embedding failed: status=%d response_body=%s",
+                response.status_code,
+                response.text[:4000],
+            )
         response.raise_for_status()
         payload = response.json()
     except (httpx.HTTPError, ValueError) as error:

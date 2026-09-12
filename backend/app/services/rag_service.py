@@ -1,24 +1,17 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
-import threading
 
-import numpy as np
-import onnxruntime as ort
-from huggingface_hub import hf_hub_download
-from tokenizers import Tokenizer
+import httpx
 from supabase import Client, create_client
 
 from app.config import settings
 
 
 logger = logging.getLogger(__name__)
-
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-_embedding_model: "OnnxEmbeddingModel | None" = None
-_embedding_model_lock = threading.Lock()
+EMBEDDING_FAILURE_MESSAGE = "Our AI service is temporarily busy. Please try again in a moment."
+HF_INFERENCE_URL = "https://router.huggingface.co/hf-inference/models/{model}"
 
 
 PROVINCE_DOMAINS = {"tenancy", "labor", "consumer"}
@@ -67,49 +60,45 @@ def _deduplicate_and_rerank(sources: list[dict], message: str, domain: str | Non
     return results
 
 
-class OnnxEmbeddingModel:
-    def __init__(self) -> None:
-        model_path = hf_hub_download(settings.embedding_onnx_model, "model.onnx")
-        tokenizer_path = hf_hub_download(settings.embedding_onnx_model, "tokenizer.json")
-        self.tokenizer = Tokenizer.from_file(tokenizer_path)
-        self.tokenizer.enable_truncation(max_length=128)
-        self.session = ort.InferenceSession(
-            model_path,
-            providers=["CPUExecutionProvider"],
-            sess_options=self._session_options(),
+def get_query_embedding(text: str) -> list[float]:
+    if not settings.huggingface_api_key:
+        raise RuntimeError(EMBEDDING_FAILURE_MESSAGE)
+
+    url = HF_INFERENCE_URL.format(model=settings.embedding_model)
+    try:
+        response = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {settings.huggingface_api_key}"},
+            json={
+                "inputs": text,
+                "parameters": {"pooling": "mean", "normalize": True},
+                "options": {"wait_for_model": True},
+            },
+            timeout=httpx.Timeout(30.0, connect=10.0),
         )
-        self.input_names = {item.name for item in self.session.get_inputs()}
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as error:
+        logger.error("Hugging Face embedding request failed: %s", error)
+        raise RuntimeError(EMBEDDING_FAILURE_MESSAGE) from error
 
-    @staticmethod
-    def _session_options() -> ort.SessionOptions:
-        options = ort.SessionOptions()
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
-        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
-        return options
+    if isinstance(payload, list) and len(payload) == 1 and isinstance(payload[0], list):
+        payload = payload[0]
+    if isinstance(payload, list) and payload and isinstance(payload[0], list):
+        if not all(isinstance(row, list) and len(row) == 384 for row in payload):
+            logger.error("Hugging Face returned an incompatible embedding response")
+            raise RuntimeError(EMBEDDING_FAILURE_MESSAGE)
+        payload = [sum(row[index] for row in payload) / len(payload) for index in range(384)]
+    if not isinstance(payload, list) or len(payload) != 384 or not all(
+        isinstance(value, (int, float)) for value in payload
+    ):
+        logger.error("Hugging Face returned an incompatible embedding response")
+        raise RuntimeError(EMBEDDING_FAILURE_MESSAGE)
 
-    def encode(self, text: str) -> list[float]:
-        encoded = self.tokenizer.encode(text)
-        inputs = {
-            "input_ids": np.asarray([encoded.ids], dtype=np.int64),
-            "attention_mask": np.asarray([encoded.attention_mask], dtype=np.int64),
-            "token_type_ids": np.asarray([encoded.type_ids], dtype=np.int64),
-        }
-        outputs = self.session.run(None, {name: value for name, value in inputs.items() if name in self.input_names})
-        embedding = np.asarray(outputs[0], dtype=np.float32).reshape(-1)
-        embedding /= max(np.linalg.norm(embedding), 1e-12)
-        return embedding.tolist()
-
-
-def get_embedding_model() -> OnnxEmbeddingModel:
-    global _embedding_model
-    if _embedding_model is None:
-        with _embedding_model_lock:
-            if _embedding_model is None:
-                logger.info("Loading ONNX embedding model on CPU: %s", settings.embedding_onnx_model)
-                _embedding_model = OnnxEmbeddingModel()
-                logger.info("ONNX embedding model loaded: %s", settings.embedding_onnx_model)
-    return _embedding_model
+    magnitude = sum(value * value for value in payload) ** 0.5
+    if magnitude == 0:
+        raise RuntimeError(EMBEDDING_FAILURE_MESSAGE)
+    return [value / magnitude for value in payload]
 
 
 def get_supabase() -> Client:
@@ -119,7 +108,7 @@ def get_supabase() -> Client:
 
 
 def retrieve(message: str, jurisdictions: list[str], domain: str | None) -> list[dict]:
-    query_embedding = get_embedding_model().encode(_retrieval_query(message, domain))
+    query_embedding = get_query_embedding(_retrieval_query(message, domain))
     match_count = CRIMINAL_RETRIEVAL_COUNT if domain == "criminal" else DEFAULT_RETRIEVAL_COUNT
     response = get_supabase().rpc(
         "match_legal_docs",

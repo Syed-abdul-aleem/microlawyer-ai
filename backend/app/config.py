@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     supabase_url: str = ""
     supabase_service_role_key: str = ""
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    embedding_onnx_model: str = "LightEmbed/sbert-paraphrase-multilingual-MiniLM-L12-v2-onnx"
+    huggingface_api_key: str = ""
     groq_api_key: str = ""
     groq_chat_model: str = "openai/gpt-oss-120b"
     groq_whisper_model: str = "whisper-large-v3-turbo"

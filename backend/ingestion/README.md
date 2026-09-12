@@ -1,16 +1,14 @@
 # Local ingestion dependencies
 
-The Render runtime uses ONNX Runtime only. Install the separate ingestion requirements on the
-computer used to build embeddings:
+The Render runtime calls Hugging Face for query embeddings. Install the separate ingestion
+requirements on the computer used to build document embeddings:
 
 ```bash
 pip install -r requirements-ingestion.txt
 ```
 
 `embed_and_upload.py` uses `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`.
-The production API uses the verified ONNX export
-`LightEmbed/sbert-paraphrase-multilingual-MiniLM-L12-v2-onnx`, which is based on the same model,
-uses the same tokenizer and pooling, and returns 384-dimensional normalized vectors.
+The production API requests the same model through Hugging Face's feature-extraction API.
 # Legal document ingestion
 
 Place source PDFs in one of these folders:
